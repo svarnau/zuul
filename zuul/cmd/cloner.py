@@ -54,6 +54,10 @@ class Cloner(zuul.cmd.ZuulApp):
         parser.add_argument('--version', dest='version', action='version',
                             version=self._get_version(),
                             help='show zuul version')
+        parser.add_argument('--cache-dir', dest='cache_dir',
+                            help=('a directory that holds cached copies of '
+                                  'repos from which to make an initial clone.'
+                                  ))
         parser.add_argument('git_base_url',
                             help='reference repo to clone from')
         parser.add_argument('projects', nargs='+',
@@ -68,10 +72,17 @@ class Cloner(zuul.cmd.ZuulApp):
                   'for example to specify an alternate branch to test '
                   'client library compatibility.')
         )
+        project_env.add_argument(
+            '--project-branch', nargs=1, action='append',
+            metavar='PROJECT=BRANCH',
+            help=('project-specific branch to checkout which takes precedence '
+                  'over --branch if it is provided; may be specified multiple '
+                  'times.')
+        )
 
         zuul_env = parser.add_argument_group(
             'zuul environnement',
-            'Let you override $ZUUL_* environnement variables.'
+            'Let you override $ZUUL_* environment variables.'
         )
         for zuul_suffix in ZUUL_ENV_SUFFIXES:
             env_name = 'ZUUL_%s' % zuul_suffix.upper()
@@ -86,7 +97,7 @@ class Cloner(zuul.cmd.ZuulApp):
         zuul_missing = [zuul_opt for zuul_opt, val in vars(args).items()
                         if zuul_opt.startswith('zuul') and val is None]
         if zuul_missing:
-            parser.error(("Some Zuul parameters are not properly set:\n\t%s\n"
+            parser.error(("Some Zuul parameters are not set:\n\t%s\n"
                           "Define them either via environment variables or "
                           "using options above." %
                           "\n\t".join(sorted(zuul_missing))))
@@ -120,6 +131,11 @@ class Cloner(zuul.cmd.ZuulApp):
     def main(self):
         self.parse_arguments()
         self.setup_logging(color=self.args.color, verbose=self.args.verbose)
+        project_branches = {}
+        if self.args.project_branch:
+            for x in self.args.project_branch:
+                project, branch = x[0].split('=')
+                project_branches[project] = branch
         cloner = zuul.lib.cloner.Cloner(
             git_base_url=self.args.git_base_url,
             projects=self.args.projects,
@@ -128,7 +144,9 @@ class Cloner(zuul.cmd.ZuulApp):
             zuul_ref=self.args.zuul_ref,
             zuul_url=self.args.zuul_url,
             branch=self.args.branch,
-            clone_map_file=self.args.clone_map_file
+            clone_map_file=self.args.clone_map_file,
+            project_branches=project_branches,
+            cache_dir=self.args.cache_dir,
         )
         cloner.execute()
 
