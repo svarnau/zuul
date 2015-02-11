@@ -50,7 +50,7 @@
         }, options);
 
         var collapsed_exceptions = [];
-        var current_filter = read_cookie('zuul_filter_string', current_filter);
+        var current_filter = read_cookie('zuul_filter_string', '');
         var $jq;
 
         var xhr,
@@ -111,6 +111,7 @@
                     );
                 }
 
+                $job_line.append($('<div style="clear: both"></div>'));
                 return $job_line;
             },
 
@@ -266,9 +267,21 @@
 
                 var $change_link = $('<small />');
                 if (change.url !== null) {
-                    $change_link.append(
-                        $('<a />').attr('href', change.url).text(change.id)
-                    );
+                    if (/^[0-9a-f]{40}$/.test(change.id)) {
+                        var change_id_short = change.id.slice(0, 7);
+                        $change_link.append(
+                            $('<a />').attr('href', change.url).append(
+                                $('<abbr />')
+                                    .attr('title', change.id)
+                                    .text(change_id_short)
+                            )
+                        );
+                    }
+                    else {
+                        $change_link.append(
+                            $('<a />').attr('href', change.url).text(change.id)
+                        );
+                    }
                 }
                 else {
                     $change_link.text(change_id);
@@ -356,6 +369,11 @@
                     icon_name = 'grey.png';
                     icon_title = 'Waiting until closer to head of queue to' +
                         ' start jobs';
+                }
+                else if (change.live !== true) {
+                    // Grey icon
+                    icon_name = 'grey.png';
+                    icon_title = 'Dependent change independently tested';
                 }
                 else if (change.failing_reasons &&
                          change.failing_reasons.length > 0) {

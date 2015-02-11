@@ -1,4 +1,4 @@
-# Copyright 2012-2014 Hewlett-Packard Development Company, L.P.
+# Copyright 2012-2015 Hewlett-Packard Development Company, L.P.
 # Copyright 2013 OpenStack Foundation
 # Copyright 2013 Antoine "hashar" Musso
 # Copyright 2013 Wikimedia Foundation Inc.
@@ -226,7 +226,7 @@ class Scheduler(threading.Thread):
             if 'python-file' in include:
                 fn = include['python-file']
                 if not os.path.isabs(fn):
-                    base = os.path.dirname(config_path)
+                    base = os.path.dirname(os.path.realpath(config_path))
                     fn = os.path.join(base, fn)
                 fn = os.path.expanduser(fn)
                 execfile(fn, config_env)
@@ -235,7 +235,8 @@ class Scheduler(threading.Thread):
             pipeline = Pipeline(conf_pipeline['name'])
             pipeline.description = conf_pipeline.get('description')
             # TODO(jeblair): remove backwards compatibility:
-            pipeline.source = self.triggers[conf_pipeline.get('source', 'gerrit')]
+            pipeline.source = self.triggers[conf_pipeline.get('source',
+                                                              'gerrit')]
             precedence = model.PRECEDENCE_MAP[conf_pipeline.get('precedence')]
             pipeline.precedence = precedence
             pipeline.failure_message = conf_pipeline.get('failure-message',
@@ -250,6 +251,8 @@ class Scheduler(threading.Thread):
             pipeline.footer_message = conf_pipeline.get('footer-message', "")
             pipeline.dequeue_on_new_patchset = conf_pipeline.get(
                 'dequeue-on-new-patchset', True)
+            pipeline.ignore_dependencies = conf_pipeline.get(
+                'ignore-dependencies', False)
 
             action_reporters = {}
             for action in ['start', 'success', 'failure', 'merge-failure']:
@@ -314,16 +317,19 @@ class Scheduler(threading.Thread):
                     usernames = toList(trigger.get('username'))
                     if not usernames:
                         usernames = toList(trigger.get('username_filter'))
-                    f = EventFilter(trigger=self.triggers['gerrit'],
-                                    types=toList(trigger['event']),
-                                    branches=toList(trigger.get('branch')),
-                                    refs=toList(trigger.get('ref')),
-                                    event_approvals=approvals,
-                                    comments=comments,
-                                    emails=emails,
-                                    usernames=usernames,
-                                    required_approvals=
-                                    toList(trigger.get('require-approval')))
+                    f = EventFilter(
+                        trigger=self.triggers['gerrit'],
+                        types=toList(trigger['event']),
+                        branches=toList(trigger.get('branch')),
+                        refs=toList(trigger.get('ref')),
+                        event_approvals=approvals,
+                        comments=comments,
+                        emails=emails,
+                        usernames=usernames,
+                        required_approvals=toList(
+                            trigger.get('require-approval')
+                        )
+                    )
                     manager.event_filters.append(f)
             if 'timer' in conf_pipeline['trigger']:
                 for trigger in toList(conf_pipeline['trigger']['timer']):
@@ -333,11 +339,14 @@ class Scheduler(threading.Thread):
                     manager.event_filters.append(f)
             if 'zuul' in conf_pipeline['trigger']:
                 for trigger in toList(conf_pipeline['trigger']['zuul']):
-                    f = EventFilter(trigger=self.triggers['zuul'],
-                                    types=toList(trigger['event']),
-                                    pipelines=toList(trigger.get('pipeline')),
-                                    required_approvals=
-                                    toList(trigger.get('require-approval')))
+                    f = EventFilter(
+                        trigger=self.triggers['zuul'],
+                        types=toList(trigger['event']),
+                        pipelines=toList(trigger.get('pipeline')),
+                        required_approvals=toList(
+                            trigger.get('require-approval')
+                        )
+                    )
                     manager.event_filters.append(f)
 
         for project_template in data.get('project-templates', []):
@@ -631,11 +640,15 @@ class Scheduler(threading.Thread):
                 self.log.debug("Re-enqueueing changes for pipeline %s" % name)
                 items_to_remove = []
                 builds_to_remove = []
+                last_head = None
                 for shared_queue in old_pipeline.queues:
                     for item in shared_queue.queue:
+                        if not item.item_ahead:
+                            last_head = item
                         item.item_ahead = None
                         item.items_behind = []
                         item.pipeline = None
+                        item.queue = None
                         project = layout.projects.get(item.change.project.name)
                         if not project:
                             self.log.warning("Unable to find project for "
@@ -651,7 +664,8 @@ class Scheduler(threading.Thread):
                                 build.job = job
                             else:
                                 builds_to_remove.append(build)
-                        if not new_pipeline.manager.reEnqueueItem(item):
+                        if not new_pipeline.manager.reEnqueueItem(item,
+                                                                  last_head):
                             items_to_remove.append(item)
                 for item in items_to_remove:
                     for build in item.current_build_set.getBuilds():
@@ -692,7 +706,7 @@ class Scheduler(threading.Thread):
                 break
             for item in shared_queue.queue:
                 if (item.change.number == change_ids[0][0] and
-                    item.change.patchset == change_ids[0][1]):
+                        item.change.patchset == change_ids[0][1]):
                     change_queue = shared_queue
                     break
         if not change_queue:
@@ -702,7 +716,7 @@ class Scheduler(threading.Thread):
             found = False
             for item in change_queue.queue:
                 if (item.change.number == number and
-                    item.change.patchset == patchset):
+                        item.change.patchset == patchset):
                     found = True
                     items_to_enqueue.append(item)
                     break
@@ -810,7 +824,7 @@ class Scheduler(threading.Thread):
         try:
             project = self.layout.projects.get(event.project_name)
             if not project:
-                self.log.warning("Project %s not found" % event.project_name)
+                self.log.debug("Project %s not found" % event.project_name)
                 return
 
             for pipeline in self.layout.pipelines.values():
@@ -1017,9 +1031,17 @@ class BasePipelineManager(object):
                 return True
         return False
 
-    def isChangeAlreadyInQueue(self, change):
-        for c in self.pipeline.getChangesInQueue():
-            if change.equals(c):
+    def isChangeAlreadyInPipeline(self, change):
+        # Checks live items in the pipeline
+        for item in self.pipeline.getAllItems():
+            if item.live and change.equals(item.change):
+                return True
+        return False
+
+    def isChangeAlreadyInQueue(self, change, change_queue):
+        # Checks any item in the specified change queue
+        for item in change_queue.queue:
+            if change.equals(item.change):
                 return True
         return False
 
@@ -1057,16 +1079,18 @@ class BasePipelineManager(object):
     def isChangeReadyToBeEnqueued(self, change):
         return True
 
-    def enqueueChangesAhead(self, change, quiet, ignore_requirements):
+    def enqueueChangesAhead(self, change, quiet, ignore_requirements,
+                            change_queue):
         return True
 
-    def enqueueChangesBehind(self, change, quiet, ignore_requirements):
+    def enqueueChangesBehind(self, change, quiet, ignore_requirements,
+                             change_queue):
         return True
 
-    def checkForChangesNeededBy(self, change):
+    def checkForChangesNeededBy(self, change, change_queue):
         return True
 
-    def getFailingDependentItem(self, item):
+    def getFailingDependentItems(self, item):
         return None
 
     def getDependentItems(self, item):
@@ -1087,42 +1111,54 @@ class BasePipelineManager(object):
         return None
 
     def findOldVersionOfChangeAlreadyInQueue(self, change):
-        for c in self.pipeline.getChangesInQueue():
-            if change.isUpdateOf(c):
-                return c
+        for item in self.pipeline.getAllItems():
+            if not item.live:
+                continue
+            if change.isUpdateOf(item.change):
+                return item
         return None
 
     def removeOldVersionsOfChange(self, change):
         if not self.pipeline.dequeue_on_new_patchset:
             return
-        old_change = self.findOldVersionOfChangeAlreadyInQueue(change)
-        if old_change:
+        old_item = self.findOldVersionOfChangeAlreadyInQueue(change)
+        if old_item:
             self.log.debug("Change %s is a new version of %s, removing %s" %
-                           (change, old_change, old_change))
-            self.removeChange(old_change)
+                           (change, old_item.change, old_item))
+            self.removeItem(old_item)
 
     def removeAbandonedChange(self, change):
         self.log.debug("Change %s abandoned, removing." % change)
-        self.removeChange(change)
+        for item in self.pipeline.getAllItems():
+            if not item.live:
+                continue
+            if item.change.equals(change):
+                self.removeItem(item)
 
-    def reEnqueueItem(self, item):
-        change_queue = self.pipeline.getQueue(item.change.project)
-        if change_queue:
-            self.log.debug("Re-enqueing change %s in queue %s" %
-                           (item.change, change_queue))
-            change_queue.enqueueItem(item)
-            self.reportStats(item)
-            return True
-        else:
-            self.log.error("Unable to find change queue for project %s" %
-                           item.change.project)
-            return False
+    def reEnqueueItem(self, item, last_head):
+        with self.getChangeQueue(item.change, last_head.queue) as change_queue:
+            if change_queue:
+                self.log.debug("Re-enqueing change %s in queue %s" %
+                               (item.change, change_queue))
+                change_queue.enqueueItem(item)
+                self.reportStats(item)
+                return True
+            else:
+                self.log.error("Unable to find change queue for project %s" %
+                               item.change.project)
+                return False
 
     def addChange(self, change, quiet=False, enqueue_time=None,
-                  ignore_requirements=False):
+                  ignore_requirements=False, live=True,
+                  change_queue=None):
         self.log.debug("Considering adding change %s" % change)
-        if self.isChangeAlreadyInQueue(change):
-            self.log.debug("Change %s is already in queue, ignoring" % change)
+
+        # If we are adding a live change, check if it's a live item
+        # anywhere in the pipeline.  Otherwise, we will perform the
+        # duplicate check below on the specific change_queue.
+        if live and self.isChangeAlreadyInPipeline(change):
+            self.log.debug("Change %s is already in pipeline, "
+                           "ignoring" % change)
             return True
 
         if not self.isChangeReadyToBeEnqueued(change):
@@ -1137,16 +1173,24 @@ class BasePipelineManager(object):
                                    "requirement %s" % (change, f))
                     return False
 
-        if not self.enqueueChangesAhead(change, quiet, ignore_requirements):
-            self.log.debug("Failed to enqueue changes ahead of %s" % change)
-            return False
+        with self.getChangeQueue(change, change_queue) as change_queue:
+            if not change_queue:
+                self.log.debug("Unable to find change queue for "
+                               "change %s in project %s" %
+                               (change, change.project))
+                return False
 
-        if self.isChangeAlreadyInQueue(change):
-            self.log.debug("Change %s is already in queue, ignoring" % change)
-            return True
+            if not self.enqueueChangesAhead(change, quiet, ignore_requirements,
+                                            change_queue):
+                self.log.debug("Failed to enqueue changes "
+                               "ahead of %s" % change)
+                return False
 
-        change_queue = self.pipeline.getQueue(change.project)
-        if change_queue:
+            if self.isChangeAlreadyInQueue(change, change_queue):
+                self.log.debug("Change %s is already in queue, "
+                               "ignoring" % change)
+                return True
+
             self.log.debug("Adding change %s to queue %s" %
                            (change, change_queue))
             if not quiet:
@@ -1155,29 +1199,26 @@ class BasePipelineManager(object):
             item = change_queue.enqueueChange(change)
             if enqueue_time:
                 item.enqueue_time = enqueue_time
+            item.live = live
             self.reportStats(item)
-            self.enqueueChangesBehind(change, quiet, ignore_requirements)
-            self.sched.triggers['zuul'].onChangeEnqueued(item.change, self.pipeline)
-        else:
-            self.log.error("Unable to find change queue for project %s" %
-                           change.project)
-            return False
+            self.enqueueChangesBehind(change, quiet, ignore_requirements,
+                                      change_queue)
+            self.sched.triggers['zuul'].onChangeEnqueued(item.change,
+                                                         self.pipeline)
+            return True
 
     def dequeueItem(self, item):
         self.log.debug("Removing change %s from queue" % item.change)
-        change_queue = self.pipeline.getQueue(item.change.project)
-        change_queue.dequeueItem(item)
+        item.queue.dequeueItem(item)
 
-    def removeChange(self, change):
-        # Remove a change from the queue, probably because it has been
+    def removeItem(self, item):
+        # Remove an item from the queue, probably because it has been
         # superseded by another change.
-        for item in self.pipeline.getAllItems():
-            if item.change == change:
-                self.log.debug("Canceling builds behind change: %s "
-                               "because it is being removed." % item.change)
-                self.cancelJobs(item)
-                self.dequeueItem(item)
-                self.reportStats(item)
+        self.log.debug("Canceling builds behind change: %s "
+                       "because it is being removed." % item.change)
+        self.cancelJobs(item)
+        self.dequeueItem(item)
+        self.reportStats(item)
 
     def _makeMergerItem(self, item):
         # Create a dictionary with all info about the item needed by
@@ -1222,12 +1263,14 @@ class BasePipelineManager(object):
             all_items = dependent_items + [item]
             merger_items = map(self._makeMergerItem, all_items)
             self.sched.merger.mergeChanges(merger_items,
-                                           item.current_build_set)
+                                           item.current_build_set,
+                                           self.pipeline.precedence)
         else:
             self.log.debug("Preparing update repo for: %s" % item.change)
             url = self.pipeline.source.getGitUrl(item.change.project)
             self.sched.merger.updateRepo(item.change.project.name,
-                                         url, build_set)
+                                         url, build_set,
+                                         self.pipeline.precedence)
         return False
 
     def _launchJobs(self, item, jobs):
@@ -1275,10 +1318,12 @@ class BasePipelineManager(object):
     def _processOneItem(self, item, nnfi, ready_ahead):
         changed = False
         item_ahead = item.item_ahead
-        change_queue = self.pipeline.getQueue(item.change.project)
+        if item_ahead and (not item_ahead.live):
+            item_ahead = None
+        change_queue = item.queue
         failing_reasons = []  # Reasons this item is failing
 
-        if self.checkForChangesNeededBy(item.change) is not True:
+        if self.checkForChangesNeededBy(item.change, change_queue) is not True:
             # It's not okay to enqueue this change, we should remove it.
             self.log.info("Dequeuing change %s because "
                           "it can no longer merge" % item.change)
@@ -1290,17 +1335,16 @@ class BasePipelineManager(object):
             except MergeFailure:
                 pass
             return (True, nnfi, ready_ahead)
-        dep_item = self.getFailingDependentItem(item)
+        dep_items = self.getFailingDependentItems(item)
         actionable = change_queue.isActionable(item)
         item.active = actionable
         ready = False
-        if dep_item:
+        if dep_items:
             failing_reasons.append('a needed change is failing')
             self.cancelJobs(item, prime=False)
         else:
             item_ahead_merged = False
-            if ((item_ahead and item_ahead.change.is_merged) or
-                not change_queue.dependent):
+            if (item_ahead and item_ahead.change.is_merged):
                 item_ahead_merged = True
             if (item_ahead != nnfi and not item_ahead_merged):
                 # Our current base is different than what we expected,
@@ -1323,7 +1367,12 @@ class BasePipelineManager(object):
             changed = True
         if self.pipeline.didAnyJobFail(item):
             failing_reasons.append("at least one job failed")
-        if (not item_ahead) and self.pipeline.areAllJobsComplete(item):
+        if (not item.live) and (not item.items_behind):
+            failing_reasons.append("is a non-live item with no items behind")
+            self.dequeueItem(item)
+            changed = True
+        if ((not item_ahead) and self.pipeline.areAllJobsComplete(item)
+            and item.live):
             try:
                 self.reportItem(item)
             except MergeFailure:
@@ -1335,7 +1384,7 @@ class BasePipelineManager(object):
                     self.cancelJobs(item_behind)
             self.dequeueItem(item)
             changed = True
-        elif not failing_reasons:
+        elif not failing_reasons and item.live:
             nnfi = item
         item.current_build_set.failing_reasons = failing_reasons
         if failing_reasons:
@@ -1419,7 +1468,7 @@ class BasePipelineManager(object):
                                                        item.change.branch)
             self.log.info("Reported change %s status: all-succeeded: %s, "
                           "merged: %s" % (item.change, succeeded, merged))
-            change_queue = self.pipeline.getQueue(item.change.project)
+            change_queue = item.queue
             if not (succeeded and merged):
                 self.log.debug("Reported change %s failed tests or failed "
                                "to merge" % (item.change))
@@ -1489,7 +1538,7 @@ class BasePipelineManager(object):
         else:
             url_pattern = None
 
-        for job in self.pipeline.getJobs(item.change):
+        for job in self.pipeline.getJobs(item):
             build = item.current_build_set.getBuild(job.name)
             result = build.result
             pattern = url_pattern
@@ -1669,6 +1718,18 @@ class BasePipelineManager(object):
             self.log.exception("Exception reporting pipeline stats")
 
 
+class DynamicChangeQueueContextManager(object):
+    def __init__(self, change_queue):
+        self.change_queue = change_queue
+
+    def __enter__(self):
+        return self.change_queue
+
+    def __exit__(self, etype, value, tb):
+        if self.change_queue and not self.change_queue.queue:
+            self.change_queue.pipeline.removeQueue(self.change_queue.queue)
+
+
 class IndependentPipelineManager(BasePipelineManager):
     log = logging.getLogger("zuul.IndependentPipelineManager")
     changes_merge = False
@@ -1676,11 +1737,86 @@ class IndependentPipelineManager(BasePipelineManager):
     def _postConfig(self, layout):
         super(IndependentPipelineManager, self)._postConfig(layout)
 
-        change_queue = ChangeQueue(self.pipeline, dependent=False)
-        for project in self.pipeline.getProjects():
-            change_queue.addProject(project)
-
+    def getChangeQueue(self, change, existing=None):
+        # creates a new change queue for every change
+        if existing:
+            return DynamicChangeQueueContextManager(existing)
+        if change.project not in self.pipeline.getProjects():
+            return DynamicChangeQueueContextManager(None)
+        change_queue = ChangeQueue(self.pipeline)
+        change_queue.addProject(change.project)
         self.pipeline.addQueue(change_queue)
+        return DynamicChangeQueueContextManager(change_queue)
+
+    def enqueueChangesAhead(self, change, quiet, ignore_requirements,
+                            change_queue):
+        ret = self.checkForChangesNeededBy(change, change_queue)
+        if ret in [True, False]:
+            return ret
+        self.log.debug("  Changes %s must be merged ahead of %s" %
+                       (ret, change))
+        for needed_change in ret:
+            # This differs from the dependent pipeline by enqueuing
+            # changes ahead as "not live", that is, not intended to
+            # have jobs run.  Also, pipeline requirements are always
+            # ignored (which is safe because the changes are not
+            # live).
+            r = self.addChange(needed_change, quiet=True,
+                               ignore_requirements=True,
+                               live=False, change_queue=change_queue)
+            if not r:
+                return False
+        return True
+
+    def checkForChangesNeededBy(self, change, change_queue):
+        if self.pipeline.ignore_dependencies:
+            return True
+        self.log.debug("Checking for changes needed by %s:" % change)
+        # Return true if okay to proceed enqueing this change,
+        # false if the change should not be enqueued.
+        if not hasattr(change, 'needs_changes'):
+            self.log.debug("  Changeish does not support dependencies")
+            return True
+        if not change.needs_changes:
+            self.log.debug("  No changes needed")
+            return True
+        changes_needed = []
+        for needed_change in change.needs_changes:
+            self.log.debug("  Change %s needs change %s:" % (
+                change, needed_change))
+            if needed_change.is_merged:
+                self.log.debug("  Needed change is merged")
+                continue
+            if self.isChangeAlreadyInQueue(needed_change, change_queue):
+                self.log.debug("  Needed change is already ahead in the queue")
+                continue
+            self.log.debug("  Change %s is needed" % needed_change)
+            if needed_change not in changes_needed:
+                changes_needed.append(needed_change)
+                continue
+            # This differs from the dependent pipeline check in not
+            # verifying that the dependent change is mergable.
+        if changes_needed:
+            return changes_needed
+        return True
+
+    def dequeueItem(self, item):
+        super(IndependentPipelineManager, self).dequeueItem(item)
+        # An independent pipeline manager dynamically removes empty
+        # queues
+        if not item.queue.queue:
+            self.pipeline.removeQueue(item.queue)
+
+
+class StaticChangeQueueContextManager(object):
+    def __init__(self, change_queue):
+        self.change_queue = change_queue
+
+    def __enter__(self):
+        return self.change_queue
+
+    def __exit__(self, etype, value, tb):
+        pass
 
 
 class DependentPipelineManager(BasePipelineManager):
@@ -1742,6 +1878,12 @@ class DependentPipelineManager(BasePipelineManager):
                 new_change_queues.append(a)
         return new_change_queues
 
+    def getChangeQueue(self, change, existing=None):
+        if existing:
+            return StaticChangeQueueContextManager(existing)
+        return StaticChangeQueueContextManager(
+            self.pipeline.getQueue(change.project))
+
     def isChangeReadyToBeEnqueued(self, change):
         if not self.pipeline.source.canMerge(change,
                                              self.getSubmitAllowNeeds()):
@@ -1749,71 +1891,111 @@ class DependentPipelineManager(BasePipelineManager):
             return False
         return True
 
-    def enqueueChangesBehind(self, change, quiet, ignore_requirements):
+    def enqueueChangesBehind(self, change, quiet, ignore_requirements,
+                             change_queue):
         to_enqueue = []
         self.log.debug("Checking for changes needing %s:" % change)
         if not hasattr(change, 'needed_by_changes'):
             self.log.debug("  Changeish does not support dependencies")
             return
-        for needs in change.needed_by_changes:
-            if self.pipeline.source.canMerge(needs,
+        for other_change in change.needed_by_changes:
+            with self.getChangeQueue(other_change) as other_change_queue:
+                if other_change_queue != change_queue:
+                    self.log.debug("  Change %s in project %s can not be "
+                                   "enqueued in the target queue %s" %
+                                   (other_change, other_change.project,
+                                    change_queue))
+                    continue
+            if self.pipeline.source.canMerge(other_change,
                                              self.getSubmitAllowNeeds()):
                 self.log.debug("  Change %s needs %s and is ready to merge" %
-                               (needs, change))
-                to_enqueue.append(needs)
+                               (other_change, change))
+                to_enqueue.append(other_change)
+
         if not to_enqueue:
             self.log.debug("  No changes need %s" % change)
 
         for other_change in to_enqueue:
             self.addChange(other_change, quiet=quiet,
-                           ignore_requirements=ignore_requirements)
+                           ignore_requirements=ignore_requirements,
+                           change_queue=change_queue)
 
-    def enqueueChangesAhead(self, change, quiet, ignore_requirements):
-        ret = self.checkForChangesNeededBy(change)
+    def enqueueChangesAhead(self, change, quiet, ignore_requirements,
+                            change_queue):
+        ret = self.checkForChangesNeededBy(change, change_queue)
         if ret in [True, False]:
             return ret
-        self.log.debug("  Change %s must be merged ahead of %s" %
+        self.log.debug("  Changes %s must be merged ahead of %s" %
                        (ret, change))
-        return self.addChange(ret, quiet=quiet,
-                              ignore_requirements=ignore_requirements)
+        for needed_change in ret:
+            r = self.addChange(needed_change, quiet=quiet,
+                               ignore_requirements=ignore_requirements,
+                               change_queue=change_queue)
+            if not r:
+                return False
+        return True
 
-    def checkForChangesNeededBy(self, change):
+    def checkForChangesNeededBy(self, change, change_queue):
         self.log.debug("Checking for changes needed by %s:" % change)
         # Return true if okay to proceed enqueing this change,
         # false if the change should not be enqueued.
-        if not hasattr(change, 'needs_change'):
+        if not hasattr(change, 'needs_changes'):
             self.log.debug("  Changeish does not support dependencies")
             return True
-        if not change.needs_change:
+        if not change.needs_changes:
             self.log.debug("  No changes needed")
             return True
-        if change.needs_change.is_merged:
-            self.log.debug("  Needed change is merged")
-            return True
-        if not change.needs_change.is_current_patchset:
-            self.log.debug("  Needed change is not the current patchset")
-            return False
-        if self.isChangeAlreadyInQueue(change.needs_change):
-            self.log.debug("  Needed change is already ahead in the queue")
-            return True
-        if self.pipeline.source.canMerge(change.needs_change,
-                                         self.getSubmitAllowNeeds()):
-            self.log.debug("  Change %s is needed" %
-                           change.needs_change)
-            return change.needs_change
-        # The needed change can't be merged.
-        self.log.debug("  Change %s is needed but can not be merged" %
-                       change.needs_change)
-        return False
+        changes_needed = []
+        # Ignore supplied change_queue
+        with self.getChangeQueue(change) as change_queue:
+            for needed_change in change.needs_changes:
+                self.log.debug("  Change %s needs change %s:" % (
+                    change, needed_change))
+                if needed_change.is_merged:
+                    self.log.debug("  Needed change is merged")
+                    continue
+                with self.getChangeQueue(needed_change) as needed_change_queue:
+                    if needed_change_queue != change_queue:
+                        self.log.debug("  Change %s in project %s does not "
+                                       "share a change queue with %s "
+                                       "in project %s" %
+                                       (needed_change, needed_change.project,
+                                        change, change.project))
+                        return False
+                if not needed_change.is_current_patchset:
+                    self.log.debug("  Needed change is not the "
+                                   "current patchset")
+                    return False
+                if self.isChangeAlreadyInQueue(needed_change, change_queue):
+                    self.log.debug("  Needed change is already ahead "
+                                   "in the queue")
+                    continue
+                if self.pipeline.source.canMerge(needed_change,
+                                                 self.getSubmitAllowNeeds()):
+                    self.log.debug("  Change %s is needed" % needed_change)
+                    if needed_change not in changes_needed:
+                        changes_needed.append(needed_change)
+                        continue
+                # The needed change can't be merged.
+                self.log.debug("  Change %s is needed but can not be merged" %
+                               needed_change)
+                return False
+        if changes_needed:
+            return changes_needed
+        return True
 
-    def getFailingDependentItem(self, item):
-        if not hasattr(item.change, 'needs_change'):
+    def getFailingDependentItems(self, item):
+        if not hasattr(item.change, 'needs_changes'):
             return None
-        if not item.change.needs_change:
+        if not item.change.needs_changes:
             return None
-        needs_item = self.getItemForChange(item.change.needs_change)
-        if not needs_item:
-            return None
-        if needs_item.current_build_set.failing_reasons:
-            return needs_item
+        failing_items = set()
+        for needed_change in item.change.needs_changes:
+            needed_item = self.getItemForChange(needed_change)
+            if not needed_item:
+                continue
+            if needed_item.current_build_set.failing_reasons:
+                failing_items.add(needed_item)
+        if failing_items:
+            return failing_items
         return None

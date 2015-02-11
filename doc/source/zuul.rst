@@ -36,7 +36,7 @@ server) are specified in a third section.
 The three sections of this config and their options are documented below.
 You can also find an example zuul.conf file in the git
 `repository
-<https://github.com/openstack-infra/zuul/blob/master/etc/zuul.conf-sample>`_
+<https://git.openstack.org/cgit/openstack-infra/zuul/tree/etc/zuul.conf-sample>`_
 
 gearman
 """""""
@@ -85,6 +85,8 @@ gerrit
 
 zuul
 """"
+
+.. _layout_config:
 
 **layout_config**
   Path to layout config file.  Used by zuul-server only.
@@ -272,10 +274,12 @@ include, and currently supports one type of inclusion, a python file::
     - python-file: local_functions.py
 
 **python-file**
-  The path to a python file.  The file will be loaded and objects that
-  it defines will be placed in a special environment which can be
-  referenced in the Zuul configuration.  Currently only the
-  parameter-function attribute of a Job uses this feature.
+  The path to a python file (either an absolute path or relative to the
+  directory name of :ref:`layout_config <layout_config>`).  The
+  file will be loaded and objects that it defines will be placed in a
+  special environment which can be referenced in the Zuul configuration.
+  Currently only the parameter-function attribute of a Job uses this
+  feature.
 
 Pipelines
 """""""""
@@ -462,7 +466,8 @@ explanation of each of the parameters::
     This may be used for any event.  It requires that a certain kind
     of approval be present for the current patchset of the change (the
     approval could be added by the event in question).  It follows the
-    same syntax as the "approval" pipeline requirement below.
+    same syntax as the :ref:`"approval" pipeline requirement below
+    <pipeline-require-approval>`.
 
   **timer**
     This trigger will run based on a cron-style time specification.
@@ -497,7 +502,8 @@ explanation of each of the parameters::
     This may be used for any event.  It requires that a certain kind
     of approval be present for the current patchset of the change (the
     approval could be added by the event in question).  It follows the
-    same syntax as the "approval" pipeline requirement below.
+    same syntax as the :ref:`"approval" pipeline requirement below
+    <pipeline-require-approval>`.
 
 
 **require**
@@ -506,6 +512,8 @@ explanation of each of the parameters::
   to be enqueued (via any trigger or automatic dependency resolution),
   the conditions specified here must be met or the item will not be
   enqueued.
+
+.. _pipeline-require-approval:
 
   **approval**
   This requires that a certain kind of approval be present for the
@@ -560,6 +568,15 @@ explanation of each of the parameters::
   jobs canceled and any dependent changes that can no longer merge as
   well.  To suppress this behavior (and allow jobs to continue
   running), set this to ``false``.  Default: ``true``.
+
+**ignore-dependencies**
+  In any kind of pipeline (dependent or independent), Zuul will
+  attempt to enqueue all dependencies ahead of the current change so
+  that they are tested together (independent pipelines report the
+  results of each change regardless of the results of changes ahead).
+  To ignore dependencies completely in an independent pipeline, set
+  this to ``true``.  This option is ignored by dependent pipelines.
+  The default is: ``false``.
 
 **success**
   Describes where Zuul should report to if all the jobs complete
@@ -924,7 +941,7 @@ return ``SUCCESS`` immediately.  This can be useful if you require
 that all changes be processed by a pipeline but a project has no jobs
 that can be run on it.
 
-.. seealso:: The OpenStack Zuul configuration for a comprehensive example: https://github.com/openstack-infra/config/blob/master/modules/openstack_project/files/zuul/layout.yaml
+.. seealso:: The OpenStack Zuul configuration for a comprehensive example: https://git.openstack.org/cgit/openstack-infra/project-config/tree/zuul/layout.yaml
 
 Project Templates
 """""""""""""""""
@@ -977,6 +994,10 @@ also be added::
         jobprefix: plugin-foobar
      check:
       - foobar-extra-special-job
+
+Individual jobs may optionally be added to pipelines (e.g. check,
+gate, et cetera) for a project, in addtion to those provided by
+templates.
 
 The order of the jobs listed in the project (which only affects the
 order of jobs listed on the report) will be the jobs from each
@@ -1034,10 +1055,19 @@ example, this would give you a list of Gerrit commands to reverify or
 recheck changes for the gate and check pipelines respectively::
 
   ./tools/zuul-changes.py --review-host=review.openstack.org \
-      http://zuul.openstack.org/ gate 'reverify no bug'
+      http://zuul.openstack.org/ gate 'reverify'
   ./tools/zuul-changes.py --review-host=review.openstack.org \
-      http://zuul.openstack.org/ check 'recheck no bug'
+      http://zuul.openstack.org/ check 'recheck'
 
-If you send a SIGUSR2 to the zuul-server process, Zuul will dump a stack
-trace for each running thread into its debug log. This is useful for
-tracking down deadlock or otherwise slow threads.
+If you send a SIGUSR2 to the zuul-server process, or the forked process
+that runs the Gearman daemon, Zuul will dump a stack trace for each
+running thread into its debug log. It is written under the log bucket
+``zuul.stack_dump``.  This is useful for tracking down deadlock or
+otherwise slow threads.
+
+When `yappi <https://code.google.com/p/yappi/>`_ (Yet Another Python
+Profiler) is available, additional functions' and threads' stats are
+emitted as well. The first SIGUSR2 will enable yappi, on the second
+SIGUSR2 it dumps the information collected, resets all yappi state and
+stops profiling. This is to minimize the impact of yappi on a running
+system.

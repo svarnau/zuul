@@ -28,18 +28,21 @@ class Cloner(object):
     log = logging.getLogger("zuul.Cloner")
 
     def __init__(self, git_base_url, projects, workspace, zuul_branch,
-                 zuul_ref, zuul_url, branch=None, clone_map_file=None):
+                 zuul_ref, zuul_url, branch=None, clone_map_file=None,
+                 project_branches=None, cache_dir=None):
 
         self.clone_map = []
         self.dests = None
 
         self.branch = branch
         self.git_url = git_base_url
+        self.cache_dir = cache_dir
         self.projects = projects
         self.workspace = workspace
-        self.zuul_branch = zuul_branch
-        self.zuul_ref = zuul_ref
+        self.zuul_branch = zuul_branch or ''
+        self.zuul_ref = zuul_ref or ''
         self.zuul_url = zuul_url
+        self.project_branches = project_branches or {}
 
         if clone_map_file:
             self.readCloneMap(clone_map_file)
@@ -64,9 +67,23 @@ class Cloner(object):
         self.log.info("Prepared all repositories")
 
     def cloneUpstream(self, project, dest):
+        # Check for a cached git repo first
+        git_cache = '%s/%s' % (self.cache_dir, project)
         git_upstream = '%s/%s' % (self.git_url, project)
-        self.log.info("Creating repo %s from upstream %s",
-                      project, git_upstream)
+        if (self.cache_dir and
+            os.path.exists(git_cache) and
+            not os.path.exists(dest)):
+            # file:// tells git not to hard-link across repos
+            git_cache = 'file://%s' % git_cache
+            self.log.info("Creating repo %s from cache %s",
+                          project, git_cache)
+            new_repo = git.Repo.clone_from(git_cache, dest)
+            self.log.info("Updating origin remote in repo %s to %s",
+                          project, git_upstream)
+            new_repo.remotes.origin.config_writer.set('url', git_upstream)
+        else:
+            self.log.info("Creating repo %s from upstream %s",
+                          project, git_upstream)
         repo = Repo(
             remote=git_upstream,
             local=dest,
@@ -98,6 +115,12 @@ class Cloner(object):
          2) Zuul reference for the master branch
          3) The tip of the indicated branch
          4) The tip of the master branch
+
+        The "indicated branch" is one of the following:
+
+         A) The project-specific override branch (from project_branches arg)
+         B) The user specified branch (from the branch arg)
+         C) ZUUL_BRANCH (from the zuul_branch arg)
         """
 
         repo = self.cloneUpstream(project, dest)
@@ -106,22 +129,24 @@ class Cloner(object):
         # Ensure that we don't have stale remotes around
         repo.prune()
 
-        override_zuul_ref = self.zuul_ref
-        # FIXME should be origin HEAD branch which might not be 'master'
-        fallback_branch = 'master'
-        fallback_zuul_ref = re.sub(self.zuul_branch, fallback_branch,
+        indicated_branch = self.branch or self.zuul_branch
+        if project in self.project_branches:
+            indicated_branch = self.project_branches[project]
+
+        override_zuul_ref = re.sub(self.zuul_branch, indicated_branch,
                                    self.zuul_ref)
 
-        if self.branch:
-            override_zuul_ref = re.sub(self.zuul_branch, self.branch,
-                                       self.zuul_ref)
-            if repo.hasBranch(self.branch):
-                self.log.debug("upstream repo has branch %s", self.branch)
-                fallback_branch = self.branch
-                fallback_zuul_ref = self.zuul_ref
-            else:
-                self.log.exception("upstream repo is missing branch %s",
-                                   self.branch)
+        if repo.hasBranch(indicated_branch):
+            self.log.debug("upstream repo has branch %s", indicated_branch)
+            fallback_branch = indicated_branch
+        else:
+            self.log.debug("upstream repo is missing branch %s",
+                           self.branch)
+            # FIXME should be origin HEAD branch which might not be 'master'
+            fallback_branch = 'master'
+
+        fallback_zuul_ref = re.sub(self.zuul_branch, fallback_branch,
+                                   self.zuul_ref)
 
         if (self.fetchFromZuul(repo, project, override_zuul_ref)
             or (fallback_zuul_ref != override_zuul_ref and
