@@ -40,6 +40,7 @@ import fixtures
 import six.moves.urllib.parse as urlparse
 import statsd
 import testtools
+from git import GitCommandError
 
 import zuul.scheduler
 import zuul.webapp
@@ -56,6 +57,7 @@ import zuul.trigger.zuultrigger
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__),
                            'fixtures')
+USE_TEMPDIR = True
 
 logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s %(name)-32s '
@@ -75,6 +77,16 @@ def repack_repo(path):
 
 def random_sha1():
     return hashlib.sha1(str(random.random())).hexdigest()
+
+
+def iterate_timeout(max_seconds, purpose):
+    start = time.time()
+    count = 0
+    while (time.time() < start + max_seconds):
+        count += 1
+        yield count
+        time.sleep(0)
+    raise Exception("Timeout waiting for %s" % purpose)
 
 
 class ChangeReference(git.Reference):
@@ -165,7 +177,7 @@ class FakeChange(object):
         if files:
             fn = files[0]
         else:
-            fn = '%s-%s' % (self.branch, self.number)
+            fn = '%s-%s' % (self.branch.replace('/', '_'), self.number)
         msg = self.subject + '-' + str(self.latest_patchset)
         c = self.add_fake_change_to_repo(msg, fn, large)
         ps_files = [{'file': '/COMMIT_MSG',
@@ -250,14 +262,16 @@ class FakeChange(object):
                     granted_on=None):
         if not granted_on:
             granted_on = time.time()
-        approval = {'description': self.categories[category][0],
-                    'type': category,
-                    'value': str(value),
-                    'by': {
-                        'username': username,
-                        'email': username + '@example.com',
-                    },
-                    'grantedOn': int(granted_on)}
+        approval = {
+            'description': self.categories[category][0],
+            'type': category,
+            'value': str(value),
+            'by': {
+                'username': username,
+                'email': username + '@example.com',
+            },
+            'grantedOn': int(granted_on)
+        }
         for i, x in enumerate(self.patchsets[-1]['approvals'][:]):
             if x['by']['username'] == username and x['type'] == category:
                 del self.patchsets[-1]['approvals'][i]
@@ -347,7 +361,7 @@ class FakeChange(object):
 
     def setMerged(self):
         if (self.depends_on_change and
-            self.depends_on_change.data['status'] != 'MERGED'):
+                self.depends_on_change.data['status'] != 'MERGED'):
             return
         if self.fail_merge:
             return
@@ -404,11 +418,15 @@ class FakeGerrit(object):
         return {}
 
     def simpleQuery(self, query):
-        # This is currently only used to return all open changes for a
-        # project
         self.queries.append(query)
-        l = [change.query() for change in self.changes.values()]
-        l.append({"type":"stats","rowCount":1,"runTimeMilliseconds":3})
+        if query.startswith('change:'):
+            # Query a specific changeid
+            changeid = query[len('change:'):]
+            l = [change.query() for change in self.changes.values()
+                 if change.data['id'] == changeid]
+        else:
+            # Query all open changes
+            l = [change.query() for change in self.changes.values()]
         return l
 
     def startWatching(self, *args, **kw):
@@ -821,8 +839,12 @@ class ZuulTestCase(testtools.TestCase):
                 level=logging.DEBUG,
                 format='%(asctime)s %(name)-32s '
                 '%(levelname)-8s %(message)s'))
-        tmp_root = self.useFixture(fixtures.TempDir(
-            rootdir=os.environ.get("ZUUL_TEST_ROOT"))).path
+        if USE_TEMPDIR:
+            tmp_root = self.useFixture(fixtures.TempDir(
+                rootdir=os.environ.get("ZUUL_TEST_ROOT"))
+            ).path
+        else:
+            tmp_root = os.environ.get("ZUUL_TEST_ROOT")
         self.test_root = os.path.join(tmp_root, "zuul-test")
         self.upstream_root = os.path.join(self.test_root, "upstream")
         self.git_root = os.path.join(self.test_root, "git")
@@ -844,6 +866,9 @@ class ZuulTestCase(testtools.TestCase):
         self.init_repo("org/project1")
         self.init_repo("org/project2")
         self.init_repo("org/project3")
+        self.init_repo("org/project4")
+        self.init_repo("org/project5")
+        self.init_repo("org/project6")
         self.init_repo("org/one-job-project")
         self.init_repo("org/nonvoting-project")
         self.init_repo("org/templated-project")
@@ -916,7 +941,8 @@ class ZuulTestCase(testtools.TestCase):
         self.sched.registerTrigger(self.gerrit)
         self.timer = zuul.trigger.timer.Timer(self.config, self.sched)
         self.sched.registerTrigger(self.timer)
-        self.zuultrigger = zuul.trigger.zuultrigger.ZuulTrigger(self.config, self.sched)
+        self.zuultrigger = zuul.trigger.zuultrigger.ZuulTrigger(self.config,
+                                                                self.sched)
         self.sched.registerTrigger(self.zuultrigger)
 
         self.sched.registerReporter(
@@ -954,6 +980,10 @@ class ZuulTestCase(testtools.TestCase):
                 repos.append(obj)
         self.assertEqual(len(repos), 0)
         self.assertEmptyQueues()
+        for pipeline in self.sched.layout.pipelines.values():
+            if isinstance(pipeline.manager,
+                          zuul.scheduler.IndependentPipelineManager):
+                self.assertEqual(len(pipeline.queues), 0)
 
     def shutdown(self):
         self.log.debug("Shutting down after tests")
@@ -998,24 +1028,38 @@ class ZuulTestCase(testtools.TestCase):
         master = repo.create_head('master')
         repo.create_tag('init')
 
-        mp = repo.create_head('mp')
-        repo.head.reference = mp
+        repo.head.reference = master
+        repo.head.reset(index=True, working_tree=True)
+        repo.git.clean('-x', '-f', '-d')
+
+        self.create_branch(project, 'mp')
+
+    def create_branch(self, project, branch):
+        path = os.path.join(self.upstream_root, project)
+        repo = git.Repo.init(path)
+        fn = os.path.join(path, 'README')
+
+        branch_head = repo.create_head(branch)
+        repo.head.reference = branch_head
         f = open(fn, 'a')
-        f.write("test mp\n")
+        f.write("test %s\n" % branch)
         f.close()
         repo.index.add([fn])
-        repo.index.commit('mp commit')
+        repo.index.commit('%s commit' % branch)
 
-        repo.head.reference = master
+        repo.head.reference = repo.heads['master']
         repo.head.reset(index=True, working_tree=True)
         repo.git.clean('-x', '-f', '-d')
 
     def ref_has_change(self, ref, change):
         path = os.path.join(self.git_root, change.project)
         repo = git.Repo(path)
-        for commit in repo.iter_commits(ref):
-            if commit.message.strip() == ('%s-1' % change.subject):
-                return True
+        try:
+            for commit in repo.iter_commits(ref):
+                if commit.message.strip() == ('%s-1' % change.subject):
+                    return True
+        except GitCommandError:
+            pass
         return False
 
     def job_has_changes(self, *args):
@@ -1173,10 +1217,10 @@ class ZuulTestCase(testtools.TestCase):
                 self.sched.trigger_event_queue.join()
                 self.sched.result_event_queue.join()
                 self.sched.run_handler_lock.acquire()
-                if (self.sched.trigger_event_queue.empty() and
+                if (not self.merge_client.build_sets and
+                    self.sched.trigger_event_queue.empty() and
                     self.sched.result_event_queue.empty() and
                     self.fake_gerrit.event_queue.empty() and
-                    not self.merge_client.build_sets and
                     self.haveAllBuildsReported() and
                     self.areAllBuildsWaiting()):
                     self.sched.run_handler_lock.release()

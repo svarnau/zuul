@@ -13,9 +13,11 @@
 # under the License.
 
 import logging
+import re
 import threading
 import time
 import urllib2
+import voluptuous
 from zuul.lib import gerrit
 from zuul.model import TriggerEvent, Change, Ref, NullChange
 
@@ -92,7 +94,6 @@ class GerritEventConnector(threading.Thread):
                                     refresh=True)
 
         self.sched.addEvent(event)
-        self.gerrit.eventDone()
 
     def run(self):
         while True:
@@ -102,6 +103,8 @@ class GerritEventConnector(threading.Thread):
                 self._handleEvent()
             except:
                 self.log.exception("Exception moving Gerrit event:")
+            finally:
+                self.gerrit.eventDone()
 
 
 class Gerrit(object):
@@ -109,6 +112,9 @@ class Gerrit(object):
     log = logging.getLogger("zuul.Gerrit")
     replication_timeout = 300
     replication_retry_interval = 5
+
+    depends_on_re = re.compile(r"^Depends-On: (I[0-9a-f]{40})\s*$",
+                               re.MULTILINE | re.IGNORECASE)
 
     def __init__(self, config, sched):
         self._change_cache = {}
@@ -249,7 +255,7 @@ class Gerrit(object):
         data = change._data
         if not data:
             return False
-        if not 'submitRecords' in data:
+        if 'submitRecords' not in data:
             return False
         try:
             for sr in data['submitRecords']:
@@ -303,7 +309,7 @@ class Gerrit(object):
             change = NullChange(project)
         return change
 
-    def _getChange(self, number, patchset, refresh=False):
+    def _getChange(self, number, patchset, refresh=False, history=None):
         key = '%s,%s' % (number, patchset)
         change = None
         if key in self._change_cache:
@@ -317,7 +323,7 @@ class Gerrit(object):
         key = '%s,%s' % (change.number, change.patchset)
         self._change_cache[key] = change
         try:
-            self.updateChange(change)
+            self.updateChange(change, history)
         except Exception:
             del self._change_cache[key]
             raise
@@ -327,18 +333,36 @@ class Gerrit(object):
         # This is a best-effort function in case Gerrit is unable to return
         # a particular change.  It happens.
         query = "project:%s status:open" % (project.name,)
-        self.log.debug("Running query %s to get project open changes" % (query,))
+        self.log.debug("Running query %s to get project open changes" %
+                       (query,))
         data = self.gerrit.simpleQuery(query)
         changes = []
-        for record in data[:-1]:
+        for record in data:
             try:
-                changes.append(self._getChange(record['number'],
-                                               record['currentPatchSet']['number']))
+                changes.append(
+                    self._getChange(record['number'],
+                                    record['currentPatchSet']['number']))
             except Exception:
-                self.log.exception("Unable to query change %s" % (record.get('number'),))
+                self.log.exception("Unable to query change %s" %
+                                   (record.get('number'),))
         return changes
 
-    def updateChange(self, change):
+    def _getDependsOnFromCommit(self, message):
+        records = []
+        seen = set()
+        for match in self.depends_on_re.findall(message):
+            if match in seen:
+                self.log.debug("Ignoring duplicate Depends-On: %s" %
+                               (match,))
+                continue
+            seen.add(match)
+            query = "change:%s" % (match,)
+            self.log.debug("Running query %s to find needed changes" %
+                           (query,))
+            records.extend(self.gerrit.simpleQuery(query))
+        return records
+
+    def updateChange(self, change, history=None):
         self.log.info("Updating information for %s,%s" %
                       (change.number, change.patchset))
         data = self.gerrit.query(change.number)
@@ -371,19 +395,43 @@ class Gerrit(object):
         change.approvals = data['currentPatchSet'].get('approvals', [])
         change.open = data['open']
         change.status = data['status']
+        change.owner = data['owner']
 
         if change.is_merged:
             # This change is merged, so we don't need to look any further
             # for dependencies.
             return change
 
-        change.needs_change = None
+        if history is None:
+            history = []
+        else:
+            history = history[:]
+        history.append(change.number)
+
+        change.needs_changes = []
         if 'dependsOn' in data:
             parts = data['dependsOn'][0]['ref'].split('/')
             dep_num, dep_ps = parts[3], parts[4]
-            dep = self._getChange(dep_num, dep_ps)
-            if not dep.is_merged:
-                change.needs_change = dep
+            if dep_num in history:
+                raise Exception("Dependency cycle detected: %s in %s" % (
+                    dep_num, history))
+            self.log.debug("Getting git-dependent change %s,%s" %
+                           (dep_num, dep_ps))
+            dep = self._getChange(dep_num, dep_ps, history=history)
+            if (not dep.is_merged) and dep not in change.needs_changes:
+                change.needs_changes.append(dep)
+
+        for record in self._getDependsOnFromCommit(data['commitMessage']):
+            dep_num = record['number']
+            dep_ps = record['currentPatchSet']['number']
+            if dep_num in history:
+                raise Exception("Dependency cycle detected: %s in %s" % (
+                    dep_num, history))
+            self.log.debug("Getting commit-dependent change %s,%s" %
+                           (dep_num, dep_ps))
+            dep = self._getChange(dep_num, dep_ps, history=history)
+            if (not dep.is_merged) and dep not in change.needs_changes:
+                change.needs_changes.append(dep)
 
         change.needed_by_changes = []
         if 'neededBy' in data:
@@ -391,7 +439,7 @@ class Gerrit(object):
                 parts = needed['ref'].split('/')
                 dep_num, dep_ps = parts[3], parts[4]
                 dep = self._getChange(dep_num, dep_ps)
-                if not dep.is_merged and dep.is_current_patchset:
+                if (not dep.is_merged) and dep.is_current_patchset:
                     change.needed_by_changes.append(dep)
 
         return change
@@ -411,3 +459,13 @@ class Gerrit(object):
         if sha:
             url += ';a=commitdiff;h=' + sha
         return url
+
+
+def validate_trigger(trigger_data):
+    """Validates the layout's trigger data."""
+    events_with_ref = ('ref-updated', )
+    for event in trigger_data['gerrit']:
+        if event['event'] not in events_with_ref and event.get('ref', False):
+            raise voluptuous.Invalid(
+                "The event %s does not include ref information, Zuul cannot "
+                "use ref filter 'ref: %s'" % (event['event'], event['ref']))
