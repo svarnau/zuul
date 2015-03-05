@@ -452,12 +452,19 @@ class Job(object):
         self.failure_pattern = None
         self.success_pattern = None
         self.parameter_function = None
-        self.hold_following_changes = False
-        self.voting = True
+        # A metajob should only supply values for attributes that have
+        # been explicitly provided, so avoid setting boolean defaults.
+        if self.is_metajob:
+            self.hold_following_changes = None
+            self.voting = None
+        else:
+            self.hold_following_changes = False
+            self.voting = True
         self.branches = []
         self._branches = []
         self.files = []
         self._files = []
+        self.skip_if_matcher = None
         self.swift = {}
 
     def __str__(self):
@@ -465,6 +472,10 @@ class Job(object):
 
     def __repr__(self):
         return '<Job %s>' % (self.name)
+
+    @property
+    def is_metajob(self):
+        return self.name.startswith('^')
 
     def copy(self, other):
         if other.failure_message:
@@ -483,10 +494,15 @@ class Job(object):
         if other.files:
             self.files = other.files[:]
             self._files = other._files[:]
+        if other.skip_if_matcher:
+            self.skip_if_matcher = other.skip_if_matcher.copy()
         if other.swift:
             self.swift.update(other.swift)
-        self.hold_following_changes = other.hold_following_changes
-        self.voting = other.voting
+        # Only non-None values should be copied for boolean attributes.
+        if other.hold_following_changes is not None:
+            self.hold_following_changes = other.hold_following_changes
+        if other.voting is not None:
+            self.voting = other.voting
 
     def changeMatches(self, change):
         matches_branch = False
@@ -505,6 +521,9 @@ class Job(object):
                     if f.match(cf):
                         matches_file = True
         if self.files and not matches_file:
+            return False
+
+        if self.skip_if_matcher and self.skip_if_matcher.matches(change):
             return False
 
         return True
@@ -774,7 +793,6 @@ class QueueItem(object):
                 'canceled': build.canceled if build else None,
                 'retry': build.retry if build else None,
                 'number': build.number if build else None,
-                'parameters': build.parameters if build else None,
                 'worker': worker
             })
 
@@ -1265,8 +1283,7 @@ class Layout(object):
         if name in self.jobs:
             return self.jobs[name]
         job = Job(name)
-        if name.startswith('^'):
-            # This is a meta-job
+        if job.is_metajob:
             regex = re.compile(name)
             self.metajobs.append((regex, job))
         else:
