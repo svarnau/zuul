@@ -316,9 +316,11 @@
                 var $enqueue_time = $('<small />').addClass('time')
                     .attr('title', 'Elapsed Time').html(enqueue_time);
 
-                var $right = $('<div />')
-                    .addClass('col-xs-4 text-right')
-                    .append($remaining_time, $('<br />'), $enqueue_time);
+                var $right = $('<div />');
+                if (change.live === true) {
+                    $right.addClass('col-xs-4 text-right')
+                        .append($remaining_time, $('<br />'), $enqueue_time);
+                }
 
                 var $header = $('<div />')
                     .addClass('row')
@@ -840,7 +842,9 @@
                     });
                     $.each(change_queue.heads, function(head_i, head) {
                         $.each(head, function(change_i, change) {
-                            count += 1;
+                            if (change.live === true) {
+                                count += 1;
+                            }
                             var idx = tree.indexOf(change.id);
                             if (idx > -1) {
                                 change._tree_index = idx;
