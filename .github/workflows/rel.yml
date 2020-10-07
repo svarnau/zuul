@@ -1,0 +1,11 @@
+name: Release Event
+on:
+  release:
+    types: [prereleased]
+
+jobs:
+  eventInfo:
+    runs-on: ubuntu-latest
+    steps:
+    - name: info
+      run: 
