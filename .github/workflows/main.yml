@@ -24,4 +24,5 @@ jobs:
       - name: Run a multi-line script
         run: |
           echo $(cat version.txt)
+          get fetch --depth=1 origin master
           git show origin/master:version.txt
