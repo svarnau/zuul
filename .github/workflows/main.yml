@@ -6,7 +6,9 @@ name: CI
 # events but only for the master branch
 on:
   push:
-    branches: [ 1.0 ]
+    branches:
+      "master"
+      "1.0"
 
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
@@ -23,6 +25,11 @@ jobs:
       # Runs a set of commands using the runners shell
       - name: Run a multi-line script
         run: |
-          echo $(cat version.txt)
-          get fetch --depth=1 origin master
-          git show origin/master:version.txt
+          myver=$(cat version.txt)
+          git fetch --depth=1 origin master
+          masver=$(git show origin/master:version.txt)
+          if [[ "$masver" == "$myver" ]]; then
+            echo Master
+          else
+            echo $myver
+          fi
