@@ -29,8 +29,18 @@ jobs:
           git fetch --depth=1 origin master
           masver=$(git show origin/master:version.txt)
           if [[ "$masver" == "$myver" ]]; then
-            echo Master
+            train=Master
           else
-            echo $myver
-            [[ $myver =~ ^([0-9]+\.[0-9]+)\.* ]] && echo ${BASH_REMATCH[1]}
+            [[ $myver =~ ^([0-9]+\.[0-9]+)\.* ]] && train=${BASH_REMATCH[1]}
           fi
+          echo "::set-output name=yb_train::${train}"
+ 
+      - name: "Trigger Repository Dispatch - zuul"
+        run: |
+          curl -XPOST -u "${{ secrets.PAT_USERNAME}}:${{secrets.PAT_TOKEN}}" \
+          -H "Accept: application/vnd.github.everest-preview+json" \
+          -H "Content-Type: application/json" https://api.github.com/repos/svarnau/zuul \
+          --data '{"event_type": "build-on-release", "client_payload":
+                   {"prerelease": "${{ github.event.release.prerelease }}",
+                    "release": "${{github.event.release.tag_name}}",
+                    "yb_release_train": ${{steps.yb_train.outputs.yb_train}} } }'
